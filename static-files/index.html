@@ -1,6 +1,15 @@
 <!DOCTYPE html>
 <html>
 <head><title>Squint REPL</title></head>
+
+<script type="importmap">
+  {
+    "imports": {
+      "squint-cljs/": "https://unpkg.com/squint-cljs/"
+    }
+  }
+</script>
+
 <body>
     <h1 id="status">Connecting...</h1>
     <script type="module">
@@ -26,95 +35,93 @@
             sendToRepl(args.join(" ") + "\n", "out");
         };
 
+        ws.onmessage = async (e) => {
+            let reqId = "unknown";
+            let reqSession = "unknown";
 
+            try {
+                const parsed = JSON.parse(e.data);
+                reqId = parsed.id;
+                reqSession = parsed.session;
+                const code = parsed.code;
 
+                // 1. Compile (REPL mode + Return context)
+                let js = compileString(code, {
+                    context: 'return',
+                    repl: true,
+                    core_module: 'squint_core'
+                });
 
+                // --- REGEX FORTRESS ---
+                // (You can actually remove Fix A if your import map works, but leaving it is safe!)
+                js = js.replace(/(['"])squint-cljs\/core\.js\1/g, '"https://unpkg.com/squint-cljs/core.js"');
 
+                // B. Convert any static imports into dynamic awaits for the AsyncFunction
+                js = js.replace(/import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"];?/g, 'globalThis.$1 = await import("$2");');
 
+                // C. Annihilate any 'export' statements emitted by repl:true
+                js = js.replace(/export\s+\{[\s\S]*?\};?/g, '');
+                js = js.replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
+                js = js.replace(/export\s+default\s+/g, '');
 
-ws.onmessage = async (e) => {
-    let reqId = "unknown";
-    let reqSession = "unknown";
+                // D. Lift variables to globalThis so they persist across evaluations
+                js = js.replace(/^(const|var|let)\s+(\w+)\s*=/gm, 'globalThis.$2 =');
+                js = js.replace(/^function\s+(\w+)/gm, 'globalThis.$1 = function');
+                // ----------------------
 
-    try {
-        const parsed = JSON.parse(e.data);
-        reqId = parsed.id;
-        reqSession = parsed.session;
-        const code = parsed.code;
+                // Output capture for this request
+                const sendOut = (text) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ out: text, id: reqId, session: reqSession }));
+                    }
+                };
 
-        // 1. Compile (REPL mode + Return context)
-        let js = compileString(code, {
-            context: 'return',
-            repl: true,
-            core_module: 'squint_core'
-        });
+                const originalLog = console.log;
+                console.log = (...args) => {
+                    sendOut(args.map(String).join(" ") + "\n");
+                    originalLog.apply(console, args);
+                };
 
-        // --- REGEX FORTRESS ---
-        // A. Fix the bare module specifier! Map it to the CDN.
-        js = js.replace(/(['"])squint-cljs\/core\.js\1/g, '"https://unpkg.com/squint-cljs/core.js"');
+                let result;
+                try {
+                    // Execute using Native AsyncFunction
+                    const AsyncFunc = Object.getPrototypeOf(async function(){}).constructor;
+                    const executor = new AsyncFunc(js);
+                    result = await executor();
+                } catch (execErr) {
+                    console.error("=== FAILING JS CODE ===\n" + js + "\n=======================");
+                    throw execErr;
+                } finally {
+                    console.log = originalLog;
+                }
 
-        // B. Convert any static imports into dynamic awaits for the AsyncFunction
-        js = js.replace(/import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"];?/g, 'globalThis.$1 = await import("$2");');
+                // FIX 2: Safely serialize the result based on its type to preserve brackets
+                let serializedValue = "nil";
+                if (result !== undefined && result !== null) {
+                     // Using JSON.stringify ensures arrays keep their brackets and strings keep their quotes!
+                     serializedValue = typeof result === 'object' ? JSON.stringify(result) : String(result);
+                }
 
-        // C. Annihilate any 'export' statements emitted by repl:true
-        js = js.replace(/export\s+\{[\s\S]*?\};?/g, '');
-        js = js.replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
-        js = js.replace(/export\s+default\s+/g, '');
+                // Send Success
+                ws.send(JSON.stringify({
+                    value: serializedValue,
+                    id: reqId,
+                    session: reqSession,
+                    status: ["done"]
+                }));
 
-        // D. Lift variables to globalThis so they persist across evaluations
-        js = js.replace(/^(const|var|let)\s+(\w+)\s*=/gm, 'globalThis.$2 =');
-        js = js.replace(/^function\s+(\w+)/gm, 'globalThis.$1 = function');
-        // ----------------------
-
-        // Output capture for this request
-        const sendOut = (text) => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ out: text, id: reqId, session: reqSession }));
+            } catch (err) {
+                console.error("FATAL REPL ERROR:", err);
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        ex: err.message,
+                        id: reqId,
+                        session: reqSession,
+                        status: ["done", "eval-error"]
+                    }));
+                }
             }
         };
-
-        const originalLog = console.log;
-        console.log = (...args) => {
-            sendOut(args.map(String).join(" ") + "\n");
-            originalLog.apply(console, args);
-        };
-
-        let result;
-        try {
-            // Execute using Native AsyncFunction
-            const AsyncFunc = Object.getPrototypeOf(async function(){}).constructor;
-            const executor = new AsyncFunc(js);
-            result = await executor();
-        } catch (execErr) {
-            console.error("=== FAILING JS CODE ===\n" + js + "\n=======================");
-            throw execErr;
-        } finally {
-            console.log = originalLog;
-        }
-
-        // Send Success
-        ws.send(JSON.stringify({
-            value: (result === undefined || result === null) ? "nil" : String(result),
-            id: reqId,
-            session: reqSession,
-            status: ["done"]
-        }));
-
-    } catch (err) {
-        console.error("FATAL REPL ERROR:", err);
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-                ex: err.message,
-                id: reqId,
-                session: reqSession,
-                status: ["done", "eval-error"]
-            }));
-        }
-    }
-};
-
-
-
 
         ws.onopen = () => { document.getElementById('status').innerText = "REPL Ready"; };
     </script>
