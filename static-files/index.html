@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>whisper UI</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.0/css/bulma.min.css">
+    <script type="importmap">
+    {
+      "imports": {
+        "squint-cljs/core.js":
+        "https://cdn.jsdelivr.net/npm/squint-cljs@0.10.186/core.js"
+      }
+    }
+    </script>
+</head>
+<body>
+
+    <script type="module">
+        //import { compileString } from
+        //'https://cdn.jsdelivr.net/npm/squint-cljs@0.10.186/index.js';
+
+        const ws = new WebSocket('ws://127.0.0.1:9001');
+
+
+import { compileString } from 'https://unpkg.com/squint-cljs/index.js';
+
+ws.onmessage = async (e) => {
+    const { code, id, session } = JSON.parse(e.data);
+
+    try {
+        // 1. Compile Squint -> JS
+        let jsCode = compileString(code, {
+            core_module: 'https://unpkg.com/squint-cljs/core.js'
+        });
+
+        // 2. Fix the Library Path Error
+        // Replaces "squint-cljs/src/..." with full CDN URLs
+        jsCode = jsCode.replace(/"squint-cljs\/src\/squint\/(.+?)\.js"/g,
+            '"https://unpkg.com/squint-cljs/src/squint/$1.js"');
+
+        // 3. The Persistence & Result Hack
+        // We look for 'export const/function foo' and change to 'window.foo'
+        // We also wrap the last expression to capture the value
+        jsCode = jsCode.replace(/^export (const|var|let|function) (\w+)/gm, 'window.$2');
+
+        // Wrap the whole thing in a self-executing async block to capture the last value
+        // Note: This is a simplified result capture.
+        const wrappedCode = `
+            try {
+                ${jsCode}
+                // If the last line is an expression, Squint generates it as a statement.
+                // For a true REPL, you'd parse the AST, but let's assume we want 'Success'
+                // unless we explicitly set a global result.
+            } catch (e) {
+                window._repl_err = e;
+            }
+        `;
+
+        const blob = new Blob([wrappedCode], { type: 'text/javascript' });
+        const url = URL.createObjectURL(blob);
+
+        await import(url);
+        URL.revokeObjectURL(url);
+
+        // Check if there's an error from the internal execution
+        if (window._repl_err) {
+            const err = window._repl_err;
+            window._repl_err = null;
+            throw err;
+        }
+
+        ws.send(JSON.stringify({
+            value: "Success", // Standard nREPL value
+            id: id,
+            session: session
+        }));
+
+    } catch (err) {
+        ws.send(JSON.stringify({ value: `Browser Error: ${err.message}`, id, session }));
+    }
+};
+
+
+
+
+//        ws.onmessage = async (e) => {
+//            const { code, id, session } = JSON.parse(e.data);
+//            console.log("Compiling:", code);
+//
+//            try {
+//                // 1. Compile Squint to JS (pointing to CDN for core)
+//                const jsCode = compileString(code, {
+//                    core_module: 'https://unpkg.com/squint-cljs/core.js'
+//                });
+//
+//                // 2. Evaluate as a Module using the Blob/Data-URL trick
+//                const encodedJs = encodeURIComponent(jsCode);
+//                const dataUri = `data:text/javascript;charset=utf-8,${encodedJs}`;
+//
+//                // Dynamic import returns a module object
+//                const module = await import(dataUri);
+//
+//                // Note: If your squint code doesn't 'export' anything,
+//                // you might need a different way to capture the return value.
+//                // For simple expressions, Squint usually outputs a direct value.
+//                // If 'import' is too strict, use this alternative for simple evals:
+//                const result = await (0, eval)(jsCode);
+//
+//                ws.send(JSON.stringify({ value: String(result), id, session }));
+//            } catch (err) {
+//                // This is where your current error is caught
+//                ws.send(JSON.stringify({ value: `Browser Error: ${err.message}`, id, session }));
+//            }
+//        };
+
+
+
+
+
+
+//        ws.onmessage = (ev) => {
+//          console.log("REPL RECEIVED:", ev.data);
+//          const { code, id, session } = JSON.parse(ev.data);
+//
+//          try {
+//            const jsCode = compileString(
+//              code,
+//              { core_url: 'squint-cljs/core.js' },
+//            );
+//
+//            const result = (0, eval)(jsCode);
+//
+//            ws.send(JSON.stringify({ value: result, id: id,
+//            session: session }));
+//          } catch (err) {
+//            ws.send(JSON.stringify({ value: `Error: ${err.message}`, id: id }));
+//          }
+//        };
+
+        // async function loadAndRun(url) {
+        //     try {
+        //         const response = await fetch(url);
+        //         const cljsCode = await response.text();
+
+        //         const jsCode = compileString(cljsCode, {
+        //             jsx: true,
+        //             context: 'statement',
+        //             core_url: 'squint-cljs/core.js'
+        //         });
+
+        //         // Execute
+        //         const blob = new Blob([jsCode], { type: 'text/javascript' });
+        //         const blobUrl = URL.createObjectURL(blob);
+        //         await import(blobUrl);
+
+        //         console.log(`Successfully compiled and ran: ${url}`);
+        //     } catch (err) {
+        //         console.error("Squint Compilation Error:", err);
+        //     }
+        // }
+
+        // // Initialize
+        // loadAndRun('./app.cljs');
+
+        /* SIMPLE REFRESH HACK:
+           If you use VS Code 'Live Server' or 'npx serve',
+           the browser usually refreshes automatically when app.cljs changes.
+        */
+    </script>
+</body>
+</html>
