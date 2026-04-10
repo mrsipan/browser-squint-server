@@ -59,6 +59,9 @@
                 // B. Convert any static imports into dynamic awaits for the AsyncFunction
                 js = js.replace(/import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"];?/g, 'globalThis.$1 = await import("$2");');
 
+                // B2. NEW: Convert named imports (import { html } from X) for macros
+js = js.replace(/import\s+\{\s*([^}]+)\s*\}\s+from\s+['"]([^'"]+)['"];?/g, 'const { $1 } = await import("$2");');
+
                 // C. Annihilate any 'export' statements emitted by repl:true
                 js = js.replace(/export\s+\{[\s\S]*?\};?/g, '');
                 js = js.replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
