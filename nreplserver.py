@@ -100,7 +100,7 @@ def application(env, start_response):
     while True:
         try:
             # Wait briefly for network activity
-            gevent.socket.wait_read(fd, timeout=0.05)
+            gevent.socket.wait_read(fd, timeout=9)
         except (gevent.timeout.Timeout, Exception) as e:
             if "timed out" not in str(e).lower():
                 break

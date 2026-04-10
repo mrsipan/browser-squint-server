@@ -1,132 +1,125 @@
 <!DOCTYPE html>
-<html>
-<head><title>Squint REPL</title></head>
-
-<script type="importmap">
-  {
-    "imports": {
-      "squint-cljs/": "https://unpkg.com/squint-cljs/"
-    }
-  }
-</script>
-
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Squint REPL</title>
+    <style>
+        body { font-family: 'Courier New', Courier, monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+        h1 { color: #569cd6; border-bottom: 1px solid #333; padding-bottom: 10px;}
+        #log { background: #2d2d2d; padding: 15px; min-height: 300px; border-radius: 5px; white-space: pre-wrap;}
+        .highlight { color: #ce9178; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "squint-cljs/": "https://unpkg.com/squint-cljs/"
+        }
+      }
+    </script>
+</head>
 <body>
-    <h1 id="status">Connecting...</h1>
+    <h1 id="status">Connecting to Bridge...</h1>
+    <div id="log">Waiting for commands from REST API...</div>
+
     <script type="module">
         import { compileString } from 'https://unpkg.com/squint-cljs/index.js';
         import * as core from 'https://unpkg.com/squint-cljs/core.js';
 
-        window.squint_core = core;
-        window.squintCore = core;
+        window.squint_core = core; // Expose Squint core
+        const uiLog = document.getElementById('log');
 
-        const ws = new WebSocket(`ws://localhost:9001${window.location.search}`);
-        window.currentRequestId = null;
+        // Connect to the Python bridge
+        const ws = new WebSocket(`ws://127.0.0.1:5757${window.location.search}`);
 
-        // --- STDOUT REDIRECTION ---
-        const sendToRepl = (val, type = "out") => {
-            if (ws.readyState === WebSocket.OPEN) {
-                const msg = { id: window.currentRequestId, session: window.currentSession };
-                msg[type] = String(val);
-                ws.send(JSON.stringify(msg));
-            }
-        };
+        // Setup AsyncFunction for top-level await support in evaluated code
+        const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
 
+        // Buffers for standard output and error
+        let currentStdOut = "";
+        let currentStdErr = "";
+
+        const origLog = console.log;
+        const origErr = console.error;
+
+        // Intercept console outputs during evaluation
         console.log = (...args) => {
-            sendToRepl(args.join(" ") + "\n", "out");
+            currentStdOut += args.join(" ") + "\n";
+            origLog(...args);
         };
+        console.error = (...args) => {
+            currentStdErr += args.join(" ") + "\n";
+            origErr(...args);
+        };
+
+        ws.onopen = () => { document.getElementById('status').innerText = "REPL Ready (Connected)"; };
+        ws.onclose = () => { document.getElementById('status').innerText = "Disconnected from Bridge"; };
 
         ws.onmessage = async (e) => {
-            let reqId = "unknown";
-            let reqSession = "unknown";
+            let reqId = null;
+
+            // Reset buffers for this execution
+            currentStdOut = "";
+            currentStdErr = "";
 
             try {
                 const parsed = JSON.parse(e.data);
-                reqId = parsed.id;
-                reqSession = parsed.session;
-                const code = parsed.code;
 
-                // 1. Compile (REPL mode + Return context)
-                let js = compileString(code, {
+                // 1. Ignore Heartbeats
+                if (parsed.type === "heartbeat") return;
+
+                reqId = parsed.id;
+                const code = parsed.code;
+                if (!code) return;
+
+                uiLog.innerHTML = `Evaluating via Bridge ID [${reqId}]:\n<span class="highlight">${code}</span>\n\n`;
+
+                // 2. Compile CLJS to JS
+                let jsCode = compileString(code, {
                     context: 'return',
                     repl: true,
                     core_module: 'squint_core'
                 });
 
-                // --- REGEX FORTRESS ---
-                // (You can actually remove Fix A if your import map works, but leaving it is safe!)
-                js = js.replace(/(['"])squint-cljs\/core\.js\1/g, '"https://unpkg.com/squint-cljs/core.js"');
+                // 3. Evaluate the JavaScript
+                const runner = new AsyncFunction(jsCode);
+                const result = await runner();
 
-                // B. Convert any static imports into dynamic awaits for the AsyncFunction
-                js = js.replace(/import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"];?/g, 'globalThis.$1 = await import("$2");');
-
-                // B2. NEW: Convert named imports (import { html } from X) for macros
-js = js.replace(/import\s+\{\s*([^}]+)\s*\}\s+from\s+['"]([^'"]+)['"];?/g, 'const { $1 } = await import("$2");');
-
-                // C. Annihilate any 'export' statements emitted by repl:true
-                js = js.replace(/export\s+\{[\s\S]*?\};?/g, '');
-                js = js.replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
-                js = js.replace(/export\s+default\s+/g, '');
-
-                // D. Lift variables to globalThis so they persist across evaluations
-                js = js.replace(/^(const|var|let)\s+(\w+)\s*=/gm, 'globalThis.$2 =');
-                js = js.replace(/^function\s+(\w+)/gm, 'globalThis.$1 = function');
-                // ----------------------
-
-                // Output capture for this request
-                const sendOut = (text) => {
-                    if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ out: text, id: reqId, session: reqSession }));
-                    }
-                };
-
-                const originalLog = console.log;
-                console.log = (...args) => {
-                    sendOut(args.map(String).join(" ") + "\n");
-                    originalLog.apply(console, args);
-                };
-
-                let result;
-                try {
-                    // Execute using Native AsyncFunction
-                    const AsyncFunc = Object.getPrototypeOf(async function(){}).constructor;
-                    const executor = new AsyncFunc(js);
-                    result = await executor();
-                } catch (execErr) {
-                    console.error("=== FAILING JS CODE ===\n" + js + "\n=======================");
-                    throw execErr;
-                } finally {
-                    console.log = originalLog;
-                }
-
-                // FIX 2: Safely serialize the result based on its type to preserve brackets
+                // 4. Serialize safely
                 let serializedValue = "nil";
                 if (result !== undefined && result !== null) {
-                     // Using JSON.stringify ensures arrays keep their brackets and strings keep their quotes!
-                     serializedValue = typeof result === 'object' ? JSON.stringify(result) : String(result);
+                    try {
+                        serializedValue = typeof result === 'object' ? JSON.stringify(result) : String(result);
+                    } catch (serErr) {
+                        serializedValue = `[Unserializable: ${typeof result}]`;
+                    }
                 }
 
-                // Send Success
+                // 5. Send Success Response to Bridge
                 ws.send(JSON.stringify({
-                    value: serializedValue,
                     id: reqId,
-                    session: reqSession,
-                    status: ["done"]
+                    value: serializedValue,
+                    out: currentStdOut,
+                    err: currentStdErr,
+                    ex: null
                 }));
 
+                uiLog.innerHTML += `Result: ${serializedValue}`;
+
             } catch (err) {
-                console.error("FATAL REPL ERROR:", err);
-                if (ws.readyState === WebSocket.OPEN) {
+                origErr("REPL ERROR:", err);
+
+                // 6. Send Error Response to Bridge
+                if (ws.readyState === WebSocket.OPEN && reqId) {
                     ws.send(JSON.stringify({
-                        ex: err.message,
                         id: reqId,
-                        session: reqSession,
-                        status: ["done", "eval-error"]
+                        value: null,
+                        out: currentStdOut,
+                        err: currentStdErr,
+                        ex: err.stack || err.message || String(err)
                     }));
                 }
             }
         };
-
-        ws.onopen = () => { document.getElementById('status').innerText = "REPL Ready"; };
     </script>
 </body>
 </html>
